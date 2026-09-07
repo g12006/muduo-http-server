@@ -1,10 +1,14 @@
 # Muduo-Style High-Concurrency HTTP Server
 
-基于 Reactor 模式（muduo 风格）从零实现的多线程高并发 HTTP/1.1 服务器。支持静态文件服务、路由分发、定时器管理、长短连接等核心功能。
+参考陈硕 muduo 网络库的 One Loop Per Thread 设计思想，从零实现的 C++17 多线程高并发 HTTP/1.1 服务器。支持静态文件服务、正则路由分发、定时踢除空闲连接，wrk 压测（4 线程 / 100 并发）达 **81k QPS**。
 
-## 项目简介
+**核心链路**：主 Reactor `accept` 新连接 → `LoopThreadPool` 轮转分发 → 从 Reactor 的 epoll 事件触发 `Channel` 回调 → `Connection` 读入 `Buffer` → HTTP 状态机解析（LINE → HEADER → BODY → DONE）→ 路由匹配（精确 / 正则 / 静态文件）→ 响应写入 `Buffer`、按需注册 `EPOLLOUT` 发出。
 
-参考陈硕 muduo 网络库的 One Loop Per Thread 设计思想，从零构建的轻量级 HTTP 服务器。旨在学习 Reactor 模型、epoll 事件驱动、非阻塞 IO、定时器轮盘、HTTP 协议解析等高并发服务端核心技术。
+**架构亮点**：
+
+- **主从 Reactor 多线程模型**：主 Reactor 只负责 accept，IO 读写分散到 N 个 One Loop Per Thread 从 Reactor——多核满载、主从解耦、连接内操作无锁
+- **异步回调下的生命周期管理**：`Connection` 以 `shared_ptr` + `enable_shared_from_this` 保活，`Channel::_tie` 用 `weak_ptr` 防止 HandleEvent 执行中途对象被释放；跨线程操作统一经 `RunInLoop`/`QueueInLoop` 投递回所属线程执行
+- **O(1) 定时器轮盘**：`timerfd` + 60 槽时间轮，每秒 tick 一次，空闲连接超时断开的插入/删除均为 O(1)，无需最小堆排序
 
 ## 架构总览
 
@@ -404,7 +408,7 @@ ab -n 100000 -c 100 http://localhost:8085/hello
 
 ---
 
-## 面试拷打要点
+## 设计权衡速答
 
 1. **Reactor 模型**：主从 Reactor 与单 Reactor 的本质区别是什么？
 2. **One Loop Per Thread**：为什么每个线程一个 EventLoop？多 EventLoop 共享一个线程有什么问题？
