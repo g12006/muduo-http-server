@@ -3,6 +3,8 @@
 #include <string>
 #include <vector>
 #include <regex>
+#include <algorithm>
+#include <cctype>
 #include <sys/stat.h>
 #include "./muduo_server.hpp"
 
@@ -398,8 +400,14 @@ class HttpRequest {
         //判断是否是短链接
         bool Close() const {
             // 没有Connection字段，或者有Connection但是值是close，则都是短链接，否则就是长连接
-            if (HasHeader("Connection") == true && GetHeader("Connection") == "keep-alive") {
-                return false;
+            if (HasHeader("Connection") == true) {
+                //HTTP 头字段的值大小写不敏感：标准客户端可能发 Keep-Alive / Keep-alive / KEEP-ALIVE
+                std::string connection_val = GetHeader("Connection");
+                std::transform(connection_val.begin(), connection_val.end(), connection_val.begin(),
+                               [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+                if (connection_val == "keep-alive") {
+                    return false;
+                }
             }
             return true;
         }
@@ -454,8 +462,14 @@ class HttpResponse {
         //判断是否是短链接
         bool Close() {
             // 没有Connection字段，或者有Connection但是值是close，则都是短链接，否则就是长连接
-            if (HasHeader("Connection") == true && GetHeader("Connection") == "keep-alive") {
-                return false;
+            if (HasHeader("Connection") == true) {
+                //HTTP 头字段的值大小写不敏感：标准客户端可能发 Keep-Alive / Keep-alive / KEEP-ALIVE
+                std::string connection_val = GetHeader("Connection");
+                std::transform(connection_val.begin(), connection_val.end(), connection_val.begin(),
+                               [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+                if (connection_val == "keep-alive") {
+                    return false;
+                }
             }
             return true;
         }

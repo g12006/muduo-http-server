@@ -17,6 +17,7 @@
 #include <signal.h>
 #include <unistd.h>
 #include <netinet/in.h>
+#include <netinet/tcp.h>
 #include <arpa/inet.h>
 #include <sys/socket.h>
 #include <sys/epoll.h>
@@ -279,12 +280,14 @@ class Socket {
         }
         //创建一个服务端连接
         bool CreateServer(uint16_t port, const std::string &ip = "0.0.0.0", bool block_flag = false) {
-            //1. 创建套接字，2. 绑定地址，3. 开始监听，4. 设置非阻塞， 5. 启动地址重用
+            //1. 创建套接字，2. 设置端口复用，3. 绑定地址，4. 开始监听，5. 设置非阻塞
+            //注意：SO_REUSEADDR 必须放在 bind() 之前，否则重启服务时会被上一轮
+            //残留的 TIME_WAIT 连接挡住，bind 直接失败（EADDRINUSE），进程 assert 退出
             if (Create() == false) return false;
+            ReuseAddress();
             if (block_flag) NonBlock();
             if (Bind(ip, port) == false) return false;
             if (Listen() == false) return false;
-            ReuseAddress();
             return true;
         }
         //创建一个客户端连接
@@ -301,6 +304,11 @@ class Socket {
             setsockopt(_sockfd, SOL_SOCKET, SO_REUSEADDR, (void*)&val, sizeof(int));
             val = 1;
             setsockopt(_sockfd, SOL_SOCKET, SO_REUSEPORT, (void*)&val, sizeof(int));
+        }
+        //设置套接字选项---开启 TCP_NODELAY 禁用 Nagle 算法，避免小响应包被延迟发送
+        void SetTcpNoDelay() {
+            int val = 1;
+            setsockopt(_sockfd, IPPROTO_TCP, TCP_NODELAY, (void*)&val, sizeof(int));
         }
         //设置套接字阻塞属性-- 设置为非阻塞
         void NonBlock() {
@@ -800,6 +808,7 @@ class Connection : public std::enable_shared_from_this<Connection> {
         //uint64_t _timer_id;   //定时器ID，必须是唯一的，这块为了简化操作使用conn_id作为定时器ID
         int _sockfd;        // 连接关联的文件描述符
         bool _enable_inactive_release;  // 连接是否启动非活跃销毁的判断标志，默认为false
+        bool _released;                 // 是否已经投递过释放任务，保证 Release 幂等（防重复释放崩溃）
         EventLoop *_loop;   // 连接所关联的一个EventLoop
         ConnStatu _statu;   // 连接状态
         Socket _socket;     // 套接字操作管理
@@ -936,7 +945,13 @@ class Connection : public std::enable_shared_from_this<Connection> {
                 return _loop->TimerRefresh(_conn_id);
             }
             //3. 如果不存在定时销毁任务，则新增
-            _loop->TimerAdd(_conn_id, sec, std::bind(&Connection::Release, this));
+            //注意：定时任务的生命周期可能长于连接本身（连接已释放、任务还留在时间轮槽位里），
+            //因此这里绝不能捕获裸 this，否则任务析构回调会落到已析构对象上 → bad_weak_ptr/段错误
+            std::weak_ptr<Connection> weak_self = shared_from_this();
+            _loop->TimerAdd(_conn_id, sec, [weak_self]() {
+                auto self = weak_self.lock();
+                if (self) self->Release();
+            });
         }
         void CancelInactiveReleaseInLoop() {
             _enable_inactive_release = false;
@@ -957,8 +972,9 @@ class Connection : public std::enable_shared_from_this<Connection> {
         }
     public:
         Connection(EventLoop *loop, uint64_t conn_id, int sockfd):_conn_id(conn_id), _sockfd(sockfd),
-            _enable_inactive_release(false), _loop(loop), _statu(CONNECTING), _socket(_sockfd),
+            _enable_inactive_release(false), _released(false), _loop(loop), _statu(CONNECTING), _socket(_sockfd),
             _channel(loop, _sockfd) {
+            _socket.SetTcpNoDelay();//禁用 Nagle，降低小响应包的往返延迟
             _channel.SetCloseCallback(std::bind(&Connection::HandleClose, this));
             _channel.SetEventCallback(std::bind(&Connection::HandleEvent, this));
             _channel.SetReadCallback(std::bind(&Connection::HandleRead, this));
@@ -1002,7 +1018,14 @@ class Connection : public std::enable_shared_from_this<Connection> {
             _loop->RunInLoop(std::bind(&Connection::ShutdownInLoop, this));
         }
         void Release() {
-            _loop->QueueInLoop(std::bind(&Connection::ReleaseInLoop, this));
+            //同一个连接可能被多条事件路径同时触发释放（EPOLLIN 读到 0 / EPOLLRDHUP / EPOLLHUP /
+            //写完主动关闭 / 非活跃超时），而 QueueInLoop 是延迟执行、不是立即执行。
+            //若不做幂等保护，就会有多个 ReleaseInLoop 排队：第一个执行完对象已析构，
+            //第二个再调 shared_from_this() 抛 std::bad_weak_ptr，异常在 IO 线程里没人接 → terminate。
+            if (_released) return;
+            _released = true;
+            std::shared_ptr<Connection> self = shared_from_this();//保活到任务执行完毕
+            _loop->QueueInLoop([this, self]() { ReleaseInLoop(); });
         }
         //启动非活跃销毁，并定义多长时间无通信就是非活跃，添加定时任务
         void EnableInactiveRelease(int sec) {
