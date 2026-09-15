@@ -1,6 +1,8 @@
 # Muduo-Style High-Concurrency HTTP Server
 
-参考陈硕 muduo 网络库的 One Loop Per Thread 设计思想，从零实现的 C++17 多线程高并发 HTTP/1.1 服务器。支持静态文件服务、正则路由分发、定时踢除空闲连接，wrk 压测（4 线程 / 100 并发）达 **81k QPS**。
+参考陈硕 muduo 网络库的 One Loop Per Thread 设计思想，从零实现的 C++17 多线程高并发 HTTP/1.1 服务器。支持静态文件服务、正则路由分发、定时踢除空闲连接，并带一个**双缓冲 + eventfd 唤醒的异步日志模块**（`async_log.hpp/.cc`）。
+
+**实测性能**（腾讯云 2 vCPU / 1.9GB，loopback，`wrk -t2 -c100 -d60s` 长连接）：**13,107 QPS / 78.7 万请求 / 0 错误**，单连接（c=1）平均延迟 **138 µs**；`ab -k -n100000 -c100` 为 13,667 QPS。压测同时暴露并修复了原始实现在高并发下的 `std::bad_weak_ptr` 崩溃（见「性能测试」一节）。
 
 **核心链路**：主 Reactor `accept` 新连接 → `LoopThreadPool` 轮转分发 → 从 Reactor 的 epoll 事件触发 `Channel` 回调 → `Connection` 读入 `Buffer` → HTTP 状态机解析（LINE → HEADER → BODY → DONE）→ 路由匹配（精确 / 正则 / 静态文件）→ 响应写入 `Buffer`、按需注册 `EPOLLOUT` 发出。
 
@@ -224,6 +226,66 @@ TcpServer
 
 ---
 
+## 异步日志模块（async_log）
+
+`async_log.hpp` / `async_log.cc` —— **双缓冲交换 + `eventfd` 唤醒 + 后端线程批量落盘**。业务线程全程不做磁盘 IO。
+
+```
+业务线程                                      后端线程
+────────                                     ────────
+LOG_INFO << ...                              poll(eventfd, timeout=3s)
+ ① 拼行到栈上 4KB 缓冲（零系统调用）            ① eventfd 可读 → 摘走整块缓冲
+ ② 锁 + memcpy 进当前 4MB 缓冲                 ② 锁外 fwrite 整块落盘（4MB/次）
+ ③ 写满 → 交给待写队列，立刻换备用缓冲           ③ 缓冲归还空闲池（上限 16 块）
+ ④ write(eventfd) 唤醒后端
+```
+
+**关键设计**
+
+| 机制 | 说明 |
+|---|---|
+| 双缓冲交换 | `cur_` / `next_` 两块 4MB 缓冲轮换，业务线程任何时刻都有可写缓冲，永不等待落盘 |
+| `eventfd` 唤醒 | 写满才通知一次；实测落盘 896MB 只唤醒 **222 次**（≈ 每次落盘 4MB） |
+| 预触页 | 4MB 缓冲首次写入触发约 1024 次缺页中断（实测单次卡 **1.8ms**），分配时一次性 `memset` 掉 |
+| 热路径优化 | 时间戳前缀按秒缓存（绕开 `localtime_r` 内部加锁）、手写整数转换替代 `snprintf`、TID 线程内缓存 |
+| 按大小滚动 | 滚动文件名带**自增序号** —— 只带秒级时间戳时，同一秒内多次滚动会 `rename()` 互相覆盖（实测踩到的坑） |
+| 优雅退出 | `Stop()` 把残留缓冲全部落盘再关闭（实测 1.8ms 写完剩余数据） |
+| 水位保护 | 单行超过 4MB 才可能丢弃，计数在 `Stats().dropped`（正常恒为 0） |
+
+**实测数据**（同机 `g++ -O2`，对照组使用**完全相同的格式化路径**，只差 IO 策略）
+
+| 指标 | 同步写 | 异步模块 |
+|---|---|---|
+| 单行耗时（墙上） | 0.28 µs | 0.28 µs |
+| 单行 CPU 时间 | 0.32 µs | 0.32 µs |
+| 单行最大阻塞 | 213.9 µs | **59.1 µs** |
+| 大流量（656MB）业务线程总耗时 | 3,092 ms | **2,777 ms**（1.11×） |
+| 4 线程并发吞吐 | — | **3.93M 行/秒** |
+| 落盘完整性 | — | 900 万行 / 896MB **零丢失**（含滚动切分验证：60 万行→7 文件） |
+
+对照"朴素同步实现"（每行 `clock_gettime + localtime_r + snprintf + fwrite`）：单行 **0.96 µs → 0.28 µs**，其中**格式化优化贡献 3.4 倍**，这部分收益对同步日志同样成立。
+
+**用法**
+
+```cpp
+#include "async_log.hpp"
+
+int main() {
+    bite::AsyncLogger::Instance().Start("logs/server.log");   // 目录自动创建，追加模式
+    LOG_INFO  << "server started, port=" << 8085;
+    LOG_ERROR << "accept failed, errno=" << errno;
+    bite::AsyncLogger::Instance().Stop();                     // 退出前把残留缓冲落盘
+}
+```
+
+```bash
+# 功能 + 三栏性能对比
+g++ -std=c++17 -O2 -pthread -o test_async_log async_log.cc test_async_log.cc
+./test_async_log 200000 4 8000000
+```
+
+---
+
 ## HTTP 层详解
 
 ### HTTP 解析状态机
@@ -304,6 +366,14 @@ make
 g++ -std=c++17 -O2 -o http_server test_muduo_server.cc -lpthread
 ```
 
+### 异步日志模块单独编译
+```bash
+make test-async-log
+# 或手动：
+g++ -std=c++17 -O2 -pthread -o test_async_log async_log.cc test_async_log.cc
+./test_async_log 200000 4 8000000   # [常规行数] [线程数] [大流量行数]
+```
+
 ### 运行
 ```bash
 ./http_server
@@ -332,30 +402,55 @@ curl -X DELETE http://localhost:8085/files/test.txt
 
 ## 性能测试
 
-### wrk 压测 (4 线程, 100 并发, 10 秒)
+### 测试环境
+
+| 项 | 值 |
+|---|---|
+| 机器 | 腾讯云 CVM **2 vCPU / 1.9GB**（AMD EPYC 7K83 @2.0GHz） |
+| 系统 | Ubuntu 24.04.4 LTS，内核 6.8.0，`g++ -std=c++17 -O2` |
+| 压测方式 | **loopback**（wrk / ab 与服务器同机），排除网络因素 |
+| 说明 | 该机器常驻云主机安全 agent（约占 18% CPU），故数据偏保守 |
+
+### 压测结果（修复后）
 
 ```bash
-wrk -t4 -c100 -d10s http://localhost:8085/hello
+# 长连接，10 秒
+wrk -t2 -c100 -d10s -s ka.lua http://127.0.0.1:8085/hello
+
+# 长连接，60 秒长稳
+wrk -t2 -c100 -d60s -s ka.lua http://127.0.0.1:8085/hello
 ```
 
+| 场景 | 命令 | 结果 |
+|---|---|---|
+| 长连接 10s ×3 | `wrk -t2 -c100 -d10s` | 12,755 / 13,284 / 13,180 QPS |
+| **长连接 60s 长稳** | `wrk -t2 -c100 -d60s` | **13,107 QPS**，787,739 请求，0 错误，进程存活 |
+| keep-alive（ab） | `ab -k -n100000 -c100` | **13,667 QPS**，`Keep-Alive requests: 100000` |
+| 单连接延迟 | `c=1` | 平均 **138 µs**（真实服务耗时） |
+| 高并发 | `wrk -t2 -c500 -d10s` | 12,010 QPS |
+
+**怎么读这组数字**：2 核 2G 单机 + loopback 同机压测，QPS 上限由 CPU 与 epoll 事件分发决定。100 并发下 wrk 报出的毫秒级延迟里绝大部分是**排队时延**（Little's Law：100 ÷ 13000 ≈ 7.7ms），不是服务处理耗时 —— 单连接实测 138 µs 才是真实处理成本。面试时这两者必须区分清楚。
+
+### ⚠️ 压测发现的崩溃（已修复）
+
+原始实现在第一次 wrk 压测（约 13.6 万请求）后就 `Aborted (core dumped)`：
+
 ```
-Running 10s test @ http://localhost:8085/hello
-  4 threads and 100 connections
-  Thread Stats   Avg      Stdev     Max   +/- Stdev
-    Latency     1.23ms    0.87ms  15.32ms   89.21%
-    Req/Sec    20.45k     2.31k   26.78k    72.50%
-  815,234 requests in 10.00s, 118.23MB read
-Requests/sec:  81,523
-Transfer/sec:   11.82MB
+terminate called after throwing an instance of 'std::bad_weak_ptr'
 ```
 
-### ab 基准测试
+根因三条，全部已修：
 
-```bash
-ab -n 100000 -c 100 http://localhost:8085/hello
-```
+| # | 问题 | 修复 |
+|---|---|---|
+| 1 | `Connection::Release()` 经 `QueueInLoop` **永远延迟入队**（`RunInLoop` 才会在 loop 线程内同步执行），而同一连接存在多条释放路径（EPOLLIN 读到 0 / EPOLLRDHUP / EPOLLHUP / DISCONNECTING / 空闲超时），于是**重复投递** → 第二次执行时对象已析构，`shared_from_this()` 抛 `bad_weak_ptr`，IO 线程内无人 catch → `terminate` | `Release()` 增加 `_released` **幂等标志**；队列任务执行期间持有 `shared_ptr` 保活 |
+| 2 | 空闲超时定时任务 `TimerAdd(..., std::bind(&Connection::Release, this))` 捕获**裸 this**，而 `~TimerTask()` 会执行未取消的回调 → 回调落在已析构对象上 | 改捕获 `weak_ptr<Connection>`，回调前 `lock()` 判空 |
+| 3 | `Socket::CreateServer` 把 `ReuseAddress()` 放在 `bind()` **之后** → SO_REUSEADDR 失效 → 重启被 TIME_WAIT 挡住 → `Acceptor::CreateServer` 的 `assert(ret == true)` 直接打挂进程 | `ReuseAddress()` 提前到 `bind()` 之前 |
 
-> 测试环境：i7-9700K / 16GB RAM / Ubuntu 22.04
+另修复两个正确性问题：
+
+- `GetHeader("Connection") == "keep-alive"` **大小写敏感** → ab / 浏览器的 `Keep-Alive` 判定失败，keep-alive 形同虚设（修复前 `ab -k` 的 `Keep-Alive requests` 为 **0**，修复后 10 万）
+- 全程未设置 `TCP_NODELAY` → 小响应包被 Nagle 延迟，补上
 
 ---
 
@@ -368,6 +463,9 @@ ab -n 100000 -c 100 http://localhost:8085/hello
 ├── test_muduo_server.cc     # 入口 + 路由注册
 ├── http.hpp                 # HTTP 层 (HttpServer/HttpContext/HttpRequest/HttpResponse/Util)
 ├── muduo_server.hpp         # 网络框架 (TcpServer/EventLoop/Channel/Poller/Buffer/...)
+├── async_log.hpp            # 异步日志模块 (AsyncLogger/FixedBuffer/LogStream)
+├── async_log.cc             # 异步日志实现 (eventfd + 后端线程 + 滚动)
+├── test_async_log.cc        # 异步日志功能与性能测试
 └── wwwroot/
     └── index.html           # 静态文件根目录
 ```
@@ -397,9 +495,10 @@ ab -n 100000 -c 100 http://localhost:8085/hello
 
 ## 已知改进方向
 
-- [ ] HTTP/1.1 默认 keep-alive（当前默认短连接）
+- [x] HTTP/1.1 keep-alive（`Connection` 头比较已改为大小写不敏感，ab `-k` 10 万请求全命中）
+- [x] `SO_REUSEADDR` 调用提前到 `bind()` 之前
+- [x] 异步日志模块（双缓冲交换 + eventfd 唤醒 + 按大小滚动）
 - [ ] HEAD 请求 body 剥离
-- [ ] `SO_REUSEADDR` 调用提前到 `bind()` 之前
 - [ ] accept fd 设置 `O_NONBLOCK`
 - [ ] `Any::get<T>()` 用运行时检查替代 `assert`
 - [ ] 支持 HTTP pipelining

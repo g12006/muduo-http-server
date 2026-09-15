@@ -6,18 +6,29 @@ TARGET = http_server
 SRCS = test_muduo_server.cc
 HEADERS = http.hpp muduo_server.hpp
 
-.PHONY: all clean run test
+LOG_TARGET = test_async_log
+LOG_SRCS = async_log.cc test_async_log.cc
+LOG_HEADERS = async_log.hpp
+
+.PHONY: all clean run test test-async-log
 
 all: $(TARGET)
 
 $(TARGET): $(SRCS) $(HEADERS)
 	$(CXX) $(CXXFLAGS) -o $@ $(SRCS) $(LDFLAGS)
 
+# 异步日志模块（双缓冲交换 + eventfd 唤醒）
+$(LOG_TARGET): $(LOG_SRCS) $(LOG_HEADERS)
+	$(CXX) $(CXXFLAGS) -pthread -o $@ $(LOG_SRCS)
+
+test-async-log: $(LOG_TARGET)
+	./$(LOG_TARGET) 200000 4 8000000
+
 run: $(TARGET)
 	./$(TARGET)
 
 clean:
-	rm -f $(TARGET)
+	rm -f $(TARGET) $(LOG_TARGET)
 
 # 压力测试
 test-hello:
